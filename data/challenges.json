@@ -1,0 +1,11 @@
+[
+  {
+    "id": 1,
+    "title": "Palindrome Check",
+    "description": "Return true if a string is a palindrome.",
+    "test_cases": [
+      {"input": "racecar", "output": true},
+      {"input": "hello", "output": false}
+    ]
+  }
+]
