@@ -1,102 +1,91 @@
 #!/usr/bin/env python3
 """
-rtsp_blink_power_mac.py
+rtsp_blink_power_opencv.py
 
-RTSP → FaceMesh blink detection → Power level overlay → Sound alert via `afplay` on Mac.
+RTSP → OpenCV Haar cascades blink detection → Power overlay → Sound alert via afplay.
 """
 
 import cv2
-import mediapipe as mp
 import numpy as np
 import subprocess
 import sys
+import time
 
 # Constants
-BLINK_THRESHOLD      = 0.20    # Eye aspect ratio under this means “closed”
-BLINK_CONSEC_FRAMES  = 2       # Frames eye must stay below threshold
+BLINK_CONSEC_FRAMES  = 2       # Frames eyes must stay undetected to count a blink
 POWER_PER_BLINK      = 100     # Power added per blink
 POWER_ALERT          = 9000    # Trigger sound when exceeded
-ALERT_SOUND_PATH     = "alert.mp3"  # Place an MP3 here, or use system sound
+ALERT_SOUND_PATH     = "alert.mp3"  # Your MP3 or use system sound
 
-# MediaPipe setup
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    max_num_faces=5,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5,
-)
+# Load Haar cascades (make sure these XML files are in the script directory)
+face_cascade = cv2.CascadeClassifier("haarcascade_frontalface_default.xml")
+eye_cascade  = cv2.CascadeClassifier("haarcascade_eye.xml")
 
-# Indices for FaceMesh eyes
-LEFT_EYE  = [33, 160, 158, 133, 153, 144]
-RIGHT_EYE = [362,385,387,263,373,380]
-
-def eye_aspect_ratio(landmarks, eye_idxs, w, h):
-    pts = [(int(landmarks[i].x * w), int(landmarks[i].y * h)) for i in eye_idxs]
-    A = np.linalg.norm(np.array(pts[1]) - np.array(pts[5]))
-    B = np.linalg.norm(np.array(pts[2]) - np.array(pts[4]))
-    C = np.linalg.norm(np.array(pts[0]) - np.array(pts[3]))
-    return (A + B) / (2.0 * C)
-
-def play_alert_mac():
-    # Nonblocking fire-and-forget
-    subprocess.Popen(["afplay", ALERT_SOUND_PATH], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def play_alert():
+    # Asynchronous macOS playback
+    subprocess.Popen(["afplay", ALERT_SOUND_PATH],
+                     stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
 
 def main(rtsp_url: str):
     cap = cv2.VideoCapture(rtsp_url)
     if not cap.isOpened():
-        print(f"❌ Couldn't open stream {rtsp_url}")
+        print(f"❌ Cannot open stream {rtsp_url}")
         sys.exit(1)
 
-    blink_counters = {}
-    blinked        = {}
-    power_levels   = {}
+    # Track blink state per face rectangle
+    blink_counters = {}   # face_id -> consecutive non-eye frames
+    blinked        = {}   # face_id -> blink already counted this closure
+    power_levels   = {}   # face_id -> power
+
+    next_face_id = 0      # assign incremental IDs
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("⚠️  Stream ended or failed.")
+            print("⚠️  Stream ended.")
             break
 
-        h, w, _ = frame.shape
-        rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = face_mesh.process(rgb)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.1, 4)
 
-        if results.multi_face_landmarks:
-            for idx, face in enumerate(results.multi_face_landmarks):
-                # Compute average EAR
-                left_ear  = eye_aspect_ratio(face.landmark, LEFT_EYE, w, h)
-                right_ear = eye_aspect_ratio(face.landmark, RIGHT_EYE, w, h)
-                ear = (left_ear + right_ear) / 2.0
+        # If faces move around, we just reassign incremental IDs each frame
+        # (for demo). In a real app you’d track faces via centroids.
+        blink_counters.clear()
+        blinked.clear()
+        power_levels.setdefault(next_face_id, 0)
 
-                # Initialize
-                blink_counters.setdefault(idx, 0)
-                blinked.setdefault(idx, False)
-                power_levels.setdefault(idx, 0)
+        for (x, y, w, h) in faces:
+            face_id = next_face_id
+            next_face_id += 1
 
-                if ear < BLINK_THRESHOLD:
-                    blink_counters[idx] += 1
-                else:
-                    if blink_counters[idx] >= BLINK_CONSEC_FRAMES and not blinked[idx]:
-                        power_levels[idx] += POWER_PER_BLINK
-                        blinked[idx] = True
-                        if power_levels[idx] > POWER_ALERT:
-                            play_alert_mac()
-                    blink_counters[idx] = 0
-                    blinked[idx]        = False
+            roi_gray  = gray[y:y+h, x:x+w]
+            eyes = eye_cascade.detectMultiScale(roi_gray)
 
-                # Draw box & power text
-                xs = [lm.x for lm in face.landmark]
-                ys = [lm.y for lm in face.landmark]
-                x1, y1 = int(min(xs)*w), int(min(ys)*h)
-                x2, y2 = int(max(xs)*w), int(max(ys)*h)
+            # Initialize if needed
+            blink_counters.setdefault(face_id, 0)
+            blinked.setdefault(face_id, False)
+            power_levels.setdefault(face_id, 0)
 
-                cv2.rectangle(frame, (x1,y1), (x2,y2), (255,0,0), 2)
-                cv2.putText(frame, f"⚡{power_levels[idx]}",
-                            (x1, max(y1-10,0)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2, cv2.LINE_AA)
+            if len(eyes) == 0:
+                blink_counters[face_id] += 1
+            else:
+                if blink_counters[face_id] >= BLINK_CONSEC_FRAMES and not blinked[face_id]:
+                    power_levels[face_id] += POWER_PER_BLINK
+                    blinked[face_id] = True
+                    if power_levels[face_id] > POWER_ALERT:
+                        play_alert()
+                blink_counters[face_id] = 0
+                blinked[face_id] = False
 
-        cv2.imshow("Blink → Power Levels (Mac)", frame)
+            # Draw face box
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+            # Overlay power
+            text = f"⚡{power_levels[face_id]}"
+            cv2.putText(frame, text, (x, y-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+
+        cv2.imshow("Blink→Power (OpenCV)", frame)
         if cv2.waitKey(1) & 0xFF in (27, ord('q')):
             break
 
@@ -105,6 +94,6 @@ def main(rtsp_url: str):
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: python rtsp_blink_power_mac.py rtsp://<stream_url>")
+        print("Usage: python rtsp_blink_power_opencv.py rtsp://<stream_url>")
         sys.exit(1)
     main(sys.argv[1])
